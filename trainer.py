@@ -1,290 +1,193 @@
-import os.path
-from collections import defaultdict
+import os
+import time
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from loguru import logger
+from torch import optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from dataset import DataSet
-from utils import BPRLoss, EmbLoss, ContrastiveLoss, init_embedding
+from metrics import metrics_dict
 
 
-#这是论文源代码
-class SpAdjEdgeDrop(nn.Module):
-    def __init__(self):
-        super(SpAdjEdgeDrop, self).__init__()
+class Trainer(object):
 
-    def forward(self, adj, keep_rate):
-        if keep_rate == 1.0:
-            return adj
-        vals = adj._values()
-        idxs = adj._indices()
-        edge_num = vals.size()
-        mask = (torch.rand(edge_num) + keep_rate).floor().type(torch.bool)
-        new_vals = vals[mask]
-        new_idxs = idxs[:, mask]
-        return torch.sparse.FloatTensor(new_idxs, new_vals, adj.shape)
-
-
-class GCN(nn.Module):
-    def __init__(self, layers, args):
-        super(GCN, self).__init__()
-        self.layers = layers
-        self.edge_dropper = SpAdjEdgeDrop()
-        self.embedding_size = args.embedding_size
-        self.gcn_method = args.gcn_method
-        self.if_add_weight, self.if_add_bias = args.if_add_weight, args.if_add_bias
-        if self.if_add_weight:
-            self.linear_layers = nn.ModuleList(
-                [nn.Linear(self.embedding_size, self.embedding_size, self.if_add_bias) for i in range(self.layers)]
-            )
-
-    def forward(self, x, adj, keep_rate):
-        all_embeddings = [x]
-        for i in range(self.layers):
-            _adj = self.edge_dropper(adj, keep_rate)
-            x = torch.sparse.mm(_adj, x)
-            all_embeddings.append(x)
-        if self.gcn_method == 'mean':
-            x = torch.mean(torch.stack(all_embeddings, dim=0), dim=0)
-        return x
-
-
-class DAGCN(nn.Module):
-    def __init__(self, args, dataset: DataSet):
-        super(DAGCN, self).__init__()
-        self.device = args.device
-        self.model_path = args.model_path
-        self.checkpoint = args.checkpoint
-        self.if_load_model = args.if_load_model
-
-        # Base
-        self.n_users = dataset.user_count
-        self.n_items = dataset.item_count
-        self.embedding_size = args.embedding_size
-        self.user_embedding = nn.Embedding(self.n_users + 1, self.embedding_size, padding_idx=0)
-        self.item_embedding = nn.Embedding(self.n_items + 1, self.embedding_size, padding_idx=0)
-
-        # 添加新的嵌入优化相关参数
-        self.emb_init_type = args.emb_init_type
-        self.emb_reg_type = args.emb_reg_type
-        self.contrast_weight = args.contrast_weight
-        self.contrast_loss = ContrastiveLoss(temperature=args.contrast_temp)
-
-        # Modules
+    def __init__(self, model, dataset: DataSet, args):
+        self.model = model.to(args.device)
+        self.dataset = dataset
         self.behaviors = dataset.behaviors
-        self.keep_rate = args.keep_rate
-        self.if_layer_norm = args.if_layer_norm
-        self.behavior_adjs = dataset.behavior_adjs
-        # 添加全局图卷积层（两轮LightGCN）
-        self.global_gcn = GCN(layers=2, args=args)  # 两轮卷积
-        self.global_adj = dataset.behavior_adjs.get('all', None)  # 获取全局图的邻接矩阵
-        # 融合权重（可调整）
-        self.fusion_weight = nn.Parameter(torch.tensor(0.01), requires_grad=False)  # 初始权重0.5
+        self.topk = args.topk
+        self.metrics = args.metrics
+        self.learning_rate = args.lr
+        self.weight_decay = args.decay
+        self.batch_size = args.batch_size
+        self.test_batch_size = args.test_batch_size
+        self.epochs = args.epochs
+        self.model_path = args.model_path
+        self.model_name = args.model_name
+        self.train_writer = args.train_writer
+        self.test_writer = args.test_writer
+        self.device = args.device
+        self.t = args.t
+        self.early_stop = args.early_stop
 
-        self.bpr_loss = BPRLoss()
-        self.emb_loss = EmbLoss()
-        self.pre_behavior_dict = dataset.pre_behavior_dict
-        self.behavior_cf_layers = dataset.behavior_cf_layers
-        self.personal_trans_dict = dataset.personal_trans_dict
+        self.optimizer = self.get_optimizer(self.model)
 
-        self.behavior_cf = defaultdict(dict)
-        for post_beh in self.behaviors:
-            pre_behaviors = self.pre_behavior_dict[post_beh]
-            pre_behavior_cf = nn.ModuleDict()
-            for pre_beh in pre_behaviors:
-                pre_behavior_cf[pre_beh] = GCN(self.behavior_cf_layers[post_beh][pre_beh], args)
-            self.behavior_cf[post_beh] = pre_behavior_cf
+    def get_optimizer(self, model):
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
+                               lr=self.learning_rate,
+                               weight_decay=self.weight_decay)
+        return optimizer
 
-        for post_beh in self.behaviors:
-            pre_behaviors = self.pre_behavior_dict[post_beh]
-            for pre_beh in pre_behaviors:
-                trans_mat = self.personal_trans_dict[post_beh][pre_beh].detach()
-                self.personal_trans_dict[post_beh][pre_beh] = nn.Parameter(trans_mat, requires_grad=False).to(
-                    self.device)
+    @logger.catch()
+    def train_model(self):
+        train_dataset_loader = DataLoader(dataset=self.dataset.behavior_dataset(),
+                                          batch_size=self.batch_size,
+                                          shuffle=True)
 
-        # Loss
-        self.reg_weight = args.reg_weight
-        self.aux_weight = args.aux_weight
-        self.if_multi_tasks = args.if_multi_tasks
-        self.mtl_type = args.mtl_type
-        self.personal_loss_ratios = dataset.personal_loss_ratios
-        self.global_loss_ratios = dataset.global_loss_ratios
-        self.loss_ratio_type = args.loss_ratio_type
+        best_valid_result = 0
+        best_valid_dict = {}
+        best_valid_epoch = 0
+        final_test = None
 
-        self.storage_all_embeddings = None
+        best_test_result = 0
+        best_test_dict = {}
+        best_test_epoch = 0
+        for epoch in range(self.epochs):
+            self.model.train()
+            test_metric_dict, validate_metric_dict = self._train_one_epoch(train_dataset_loader, epoch)
+            valid_result = validate_metric_dict['ndcg@10']
+            test_result = test_metric_dict['hit@10']
 
-        self._init_weights()
-        self._load_model()
+            # update
+            if valid_result - best_valid_result > 0:
+                final_test = test_metric_dict
+                best_valid_result = valid_result
+                best_valid_dict = validate_metric_dict
+                best_valid_epoch = epoch
 
-    def _init_weights(self):
-        # 使用改进的嵌入初始化方法
-        self.user_embedding = init_embedding(
-            self.user_embedding,
-            init_type=self.emb_init_type
+            if test_result - best_test_result > 0:
+                best_test_result = test_result
+                best_test_dict = test_metric_dict
+                best_test_epoch = epoch
+                self.save_model(self.model)
+                logger.info(f"model saved at epoch %d" % (epoch + 1))
+
+            # early stop
+            if epoch - best_valid_epoch > self.early_stop:
+                break
+
+        logger.info(f"training end, best valid epoch %d, results: %s" %
+                    (best_valid_epoch + 1, best_valid_dict.__str__()))
+
+        logger.info(f"final test result:  %s" % final_test.__str__())
+
+        logger.info(f"best test epoch %d, results: %s" %
+                    (best_test_epoch + 1, best_test_dict.__str__()))
+
+    def _train_one_epoch(self, behavior_dataset_loader, epoch):
+        start_time = time.time()
+        behavior_dataset_iter = (
+            tqdm(
+                enumerate(behavior_dataset_loader),
+                total=len(behavior_dataset_loader),
+                desc=f"\033[1;35m Train {epoch + 1:>5}\033[0m"
+            )
         )
-        self.item_embedding = init_embedding(
-            self.item_embedding,
-            init_type=self.emb_init_type
+
+        # train
+        total_loss = 0.0
+        batch_no = 0
+        for batch_index, batch_data in behavior_dataset_iter:
+            batch_data = batch_data.to(self.device)
+            self.optimizer.zero_grad()
+            loss = self.model(batch_data)
+            loss.backward()
+            self.optimizer.step()
+            batch_no = batch_index + 1
+            total_loss += loss.item()
+        total_loss = total_loss / batch_no
+
+        self.train_writer.add_scalar('total train loss', total_loss, epoch + 1)
+        epoch_time = time.time() - start_time
+        logger.info('epoch %d, time %.2fs, train loss: %.4f ' % (epoch + 1, epoch_time, total_loss))
+
+        # validate
+        start_time = time.time()
+        validate_metric_dict = self.evaluate(epoch, self.test_batch_size, self.dataset.validate_dataset(),
+                                             self.dataset.validation_dict, self.dataset.validation_gt_length,
+                                             self.train_writer)
+        epoch_time = time.time() - start_time
+        logger.info(
+            f"validation %d, time %.2fs, result: %s " % (epoch + 1, epoch_time, validate_metric_dict.__str__()))
+
+        # test
+        start_time = time.time()
+        test_metric_dict = self.evaluate(epoch, self.test_batch_size, self.dataset.test_dataset(),
+                                         self.dataset.test_dict, self.dataset.test_gt_length,
+                                         self.test_writer)
+        epoch_time = time.time() - start_time
+        logger.info(f"test %d, time %.2fs, result: %s " % (epoch + 1, epoch_time, test_metric_dict.__str__()))
+
+        return test_metric_dict, validate_metric_dict
+
+    @logger.catch()
+    @torch.no_grad()
+    def evaluate(self, epoch, test_batch_size, dataset, gt_interacts, gt_length, writer):
+        data_loader = DataLoader(dataset=dataset, batch_size=test_batch_size)
+
+        self.model.eval()
+        iter_data = (
+            tqdm(
+                enumerate(data_loader),
+                total=len(data_loader),
+                desc=f"\033[1;35mEvaluate \033[0m"
+            )
         )
+        topk_list = []
+        train_items = self.dataset.train_user_behavior_dict[self.behaviors[-1]]
+        for batch_index, batch_data in iter_data:
+            batch_data = batch_data.to(self.device)
+            scores = self.model.full_predict(batch_data)  # (test_bsz, |I|)
 
-    def _load_model(self):
-        if self.if_load_model:
-            parameters = torch.load(os.path.join(self.model_path, self.checkpoint, 'model.pth'))
-            self.load_state_dict(parameters, strict=False)
+            batch_data = batch_data.to('cpu')
+            scores = scores.to('cpu')
+            for index, user in enumerate(batch_data):
+                user_score = scores[index]
+                items = train_items.get(user.item(), None)
+                if items is not None:
+                    user_score[items] = -np.inf
+                _, topk_idx = torch.topk(user_score, max(self.topk), dim=-1)
+                gt_items = gt_interacts[user.item()]
+                mask = np.isin(topk_idx.to('cpu'), gt_items)
+                topk_list.append(mask)
 
-    def gcn_propagate(self, with_augmentation=False):
-        all_embeddings = {}
-        last_embedding = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
-        all_embeddings['all'] = last_embedding
+        topk_list = np.array(topk_list)
+        metric_dict = self.calculate_result(topk_list, gt_length)
+        for key, value in metric_dict.items():
+            writer.add_scalar('evaluate ' + key, value, epoch + 1)
+        return metric_dict
 
-        # 用于对比学习的增强视图
-        aug_embeddings = {}
-        if with_augmentation:
-            # 通过dropout创建嵌入的不同视图
-            drop_rate = 0.2
-            aug_last_embedding = F.dropout(last_embedding, p=drop_rate, training=self.training)
-            aug_embeddings['all'] = aug_last_embedding
+    def calculate_result(self, topk_list, gt_len):
+        result_list = []
+        for metric in self.metrics:
+            metric_fuc = metrics_dict[metric.lower()]
+            result = metric_fuc(topk_list, gt_len)
+            result_list.append(result)
+        result_list = np.stack(result_list, axis=0).mean(axis=1)
+        metric_dict = {}
+        for topk in self.topk:
+            for metric, value in zip(self.metrics, result_list):
+                key = '{}@{}'.format(metric, topk)
+                metric_dict[key] = np.round(value[topk - 1], 4)
 
-        for post_beh in self.behaviors:
-            pre_behaviors = self.pre_behavior_dict[post_beh]
-            pre_behaviors = pre_behaviors[::-1]
-            post_embeddings = []
+        return metric_dict
 
-            # 增强视图的传播
-            aug_post_embeddings = [] if with_augmentation else None
-
-            for index, pre_beh in enumerate(pre_behaviors):
-                pre_embedding = all_embeddings[pre_beh]
-                layer_adj = self.behavior_adjs[post_beh].to(self.device)
-                lightgcn_all_embeddings = self.behavior_cf[post_beh][pre_beh](pre_embedding, layer_adj, self.keep_rate)
-                trans_mat = self.personal_trans_dict[post_beh][pre_beh].to(self.device)
-                post_embedding = torch.mul(trans_mat, lightgcn_all_embeddings)
-                post_embeddings.append(post_embedding)
-
-                # 增强视图的传播
-                if with_augmentation:
-                    aug_pre_embedding = aug_embeddings[pre_beh]
-                    aug_lightgcn_emb = self.behavior_cf[post_beh][pre_beh](
-                        aug_pre_embedding, layer_adj, self.keep_rate * 0.8)  # 不同的keep_rate增强差异
-                    aug_post_emb = torch.mul(trans_mat, aug_lightgcn_emb)
-                    aug_post_embeddings.append(aug_post_emb)
-
-            agg_messages = sum(post_embeddings)
-            if self.if_layer_norm:
-                agg_messages = F.normalize(agg_messages, dim=-1)
-            cur_embedding = agg_messages + last_embedding
-            all_embeddings[post_beh] = cur_embedding
-            last_embedding = cur_embedding
-
-            # 处理增强视图
-            if with_augmentation:
-                aug_agg_messages = sum(aug_post_embeddings)
-                if self.if_layer_norm:
-                    aug_agg_messages = F.normalize(aug_agg_messages, dim=-1)
-                aug_cur_embedding = aug_agg_messages + aug_last_embedding
-                aug_embeddings[post_beh] = aug_cur_embedding
-                aug_last_embedding = aug_cur_embedding
-
-        if with_augmentation:
-            return all_embeddings, aug_embeddings
-        return all_embeddings
-
-    def forward(self, batch_data):
-        self.storage_all_embeddings = None
-
-        all_embeddings, aug_embeddings = self.gcn_propagate(with_augmentation=True)
-        total_loss = 0
-        for index, behavior in enumerate(self.behaviors):
-            if self.if_multi_tasks or behavior == self.behaviors[-1]:
-                data = batch_data[:, index]  # (bsz,3)
-                users = data[:, 0].long()  # (bsz,)
-                items = data[:, 1:].long()  # (bsz, 2)
-                user_all_embedding, item_all_embedding = torch.split(all_embeddings[behavior],
-                                                                     [self.n_users + 1, self.n_items + 1])
-
-                user_feature = user_all_embedding[users.view(-1, 1)].expand(-1, items.shape[1], -1)  # (bsz, 2, dim)
-                item_feature = item_all_embedding[items]  # (bsz, 2, dim)
-                scores = torch.sum(user_feature * item_feature, dim=2)  # (bsz, 2)
-
-                mask = torch.where(users != 0)[0]
-                scores = scores[mask]
-
-                # MTL - Personalized
-                if self.mtl_type == 'personalized':
-                    if behavior == self.behaviors[-1]:
-                        user_loss_ratios = torch.ones_like(users).float()
-                    else:
-                        user_loss_ratios = self.personal_loss_ratios[behavior][users].to(self.device)
-                        user_loss_ratios = self.aux_weight * user_loss_ratios
-                    user_loss_ratios = user_loss_ratios[mask]
-                    total_loss += (user_loss_ratios * self.bpr_loss(scores[:, 0], scores[:, 1])).mean()
-
-                # MTL - Global
-                elif self.mtl_type == 'global':
-                    if behavior == self.behaviors[-1]:
-                        beh_loss_ratio = 1.0
-                    else:
-                        beh_loss_ratio = self.aux_weight * self.global_loss_ratios[behavior]
-                    total_loss += (beh_loss_ratio * self.bpr_loss(scores[:, 0], scores[:, 1])).mean()
-
-                # Single Task or MTL-addition
-                else:
-                    total_loss += (self.bpr_loss(scores[:, 0], scores[:, 1])).mean()
-
-        total_loss = total_loss + self.reg_weight * self.emb_loss(self.user_embedding.weight,
-                                                                  self.item_embedding.weight)
-        if self.contrast_weight > 0 and self.training:
-            # 对用户和物品嵌入进行对比学习
-            user_emb, item_emb = torch.split(all_embeddings[self.behaviors[-1]],
-                                             [self.n_users + 1, self.n_items + 1])
-            aug_user_emb, aug_item_emb = torch.split(aug_embeddings[self.behaviors[-1]],
-                                                     [self.n_users + 1, self.n_items + 1])
-
-            # 只对有交互的用户计算对比损失
-            users_in_batch = batch_data[:, 0, 0].unique()
-            valid_users = users_in_batch[users_in_batch != 0]
-
-            # 计算用户嵌入的对比损失
-            if len(valid_users) > 0:
-                user_contrast_loss = self.contrast_loss(
-                    user_emb[valid_users],
-                    aug_user_emb[valid_users]
-                )
-                total_loss += self.contrast_weight * user_contrast_loss
-
-            # 计算物品嵌入的对比损失
-            items_in_batch = batch_data[:, :, 1].unique()
-            valid_items = items_in_batch[items_in_batch != 0]
-            if len(valid_items) > 0:
-                item_contrast_loss = self.contrast_loss(
-                    item_emb[valid_items],
-                    aug_item_emb[valid_items]
-                )
-                total_loss += self.contrast_weight * item_contrast_loss
-
-        # 改进的嵌入正则化
-        if self.emb_reg_type == 'l2':
-            reg_loss = self.emb_loss(self.user_embedding.weight, self.item_embedding.weight)
-        elif self.emb_reg_type == 'l1':
-            reg_loss = torch.mean(torch.abs(self.user_embedding.weight)) + \
-                       torch.mean(torch.abs(self.item_embedding.weight))
-        elif self.emb_reg_type == 'l2+l1':
-            reg_loss = self.emb_loss(self.user_embedding.weight, self.item_embedding.weight) + \
-                       torch.mean(torch.abs(self.user_embedding.weight)) + \
-                       torch.mean(torch.abs(self.item_embedding.weight))
-        else:
-            reg_loss = 0
-
-        total_loss = total_loss + self.reg_weight * reg_loss
-        return total_loss
-
-    def full_predict(self, users):
-        if self.storage_all_embeddings is None:
-            self.storage_all_embeddings = self.gcn_propagate()
-
-        user_embedding, item_embedding = torch.split(self.storage_all_embeddings[self.behaviors[-1]],
-                                                     [self.n_users + 1, self.n_items + 1])
-        user_emb = user_embedding[users.long()]  # (test_bsz, dim)
-        scores = torch.matmul(user_emb, item_embedding.transpose(0, 1))  # (test_bsz, |I|)
-        return scores
+    def save_model(self, model):
+        full_model_path = os.path.join(self.model_path, self.t)
+        if not os.path.exists(full_model_path):
+            os.makedirs(full_model_path)
+        torch.save(model.state_dict(), os.path.join(full_model_path, 'model.pth'))
+        torch.save(model.storage_all_embeddings, os.path.join(full_model_path, 'all_embeddings.pth'))
